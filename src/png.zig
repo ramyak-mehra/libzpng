@@ -3,7 +3,6 @@ const Buffer = @import("buffer.zig").Buffer;
 
 const assert = std.debug.assert;
 const inflate = std.compress.flate.inflate;
-const debug = std.debug;
 
 const Allocator = std.mem.Allocator;
 
@@ -22,7 +21,7 @@ pub const Decoder = struct {
     pub fn nextChunk(self: *Decoder) !?Chunk {
         if (!self.lastChunk) {
             const chunk = try Chunk.parse(&self.data);
-            std.debug.print("Chunk Type: {}\n", .{chunk.chunkType()});
+            std.log.debug("Chunk Type: {}", .{chunk.chunkType()});
             const chunkData = try chunk.parseData();
             switch (chunkData) {
                 .IHDR => {
@@ -46,7 +45,6 @@ pub const Decoder = struct {
         var dataBuffer = std.ArrayList(u8).init(allocator);
 
         while (try self.nextChunk()) |chunk| {
-            std.debug.print("Chunk Type: {}\n", .{chunk.chunkType()});
             if (chunk.chunkType() == ChunkType.IDAT) {
                 try dataBuffer.appendSlice(chunk.data);
             }
@@ -82,7 +80,7 @@ pub const Decoder = struct {
 
         for (0..header.height) |y| {
             const filter: Filter = @enumFromInt(data[y * bytesPerScanLine]);
-            debug.print("Filter: {}, height: {}\n", .{ filter, y });
+            std.log.debug("Filter: {}, height: {}", .{ filter, y });
 
             const start = y * bytesPerScanLine + 1;
             const end = start + bytesPerScanLine - 1;

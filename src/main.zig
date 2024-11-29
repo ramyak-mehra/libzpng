@@ -17,7 +17,7 @@ pub fn main() !void {
     if (file_path == null) {
         try print_help();
     } else {
-        std.debug.print("Reading file args: {s}\n", .{file_path.?});
+        std.log.info("Reading file: {s}", .{file_path.?});
 
         const file = try fs.openFileAbsolute(file_path.?, fs.File.OpenFlags{});
 
@@ -35,12 +35,12 @@ pub fn main() !void {
         const uncompressedData = try png.Decoder.decompress(imageDataFixedStream.reader(), gpa.allocator());
         defer gpa.allocator().free(uncompressedData);
 
-        std.debug.print("Heder: {any}\n", .{decoder.header});
+        std.log.info("PNG Heder: {any}", .{decoder.header});
 
         const dd = try decoder.displayData(gpa.allocator(), uncompressedData);
         defer gpa.allocator().free(dd);
-
-        const output_ppf_f = try std.fs.cwd().createFile("output.ppm", .{});
+        const fileName = "output.ppm";
+        const output_ppf_f = try std.fs.cwd().createFile(fileName, .{});
         defer output_ppf_f.close();
         const writer = output_ppf_f.writer();
         try writer.print(
@@ -51,6 +51,7 @@ pub fn main() !void {
         , .{ decoder.header.?.width, decoder.header.?.height });
 
         try writer.writeAll(dd);
+        std.log.info("File saved as {s}", .{fileName});
     }
 }
 

@@ -55,5 +55,5 @@ pub fn main() !void {
 }
 
 fn print_help() !void {
-    _ = try std.io.getStdOut().write("Usage\nPass file path to read");
+    _ = try std.io.getStdOut().write("Usage:\nPass file path to read\n");
 }

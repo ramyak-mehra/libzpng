@@ -1,100 +1,83 @@
 const std = @import("std");
+const Buffer = @import("buffer.zig").Buffer;
+
 const assert = std.debug.assert;
 const inflate = std.compress.flate.inflate;
-const mem = std.mem;
 const debug = std.debug;
 
 const Allocator = std.mem.Allocator;
 
+pub fn decoder(data: []const u8) !Decoder {
+    const buffer = Buffer.init(data);
+
+    return Decoder{ .data = buffer, .lastChunk = false, .header = null };
+}
+
 pub const Decoder = struct {
-    const Self = @This();
-    chunks: std.ArrayList(Chunk),
-    data: std.ArrayList(u8),
-    header: ?Header,
-    palette: ?Palette,
+    data: Buffer,
+    lastChunk: bool,
+    header: ?IHDR,
 
-    pub fn decode(reader: anytype, allocator: Allocator) !Self {
-        var chunks = std.ArrayList(Chunk).init(allocator);
-        var data = std.ArrayList(u8).init(allocator);
-        defer data.deinit();
-        var header: ?Header = null;
-        var palette: ?Palette = null;
-
-        while (true) {
-            const chunk = try Chunk.init(reader, allocator);
-
-            try chunks.append(chunk);
-
-            std.debug.print("Length: {}, Type: {}\n", .{ chunk.length, chunk.chunkType });
-
-            switch (chunk.chunkType) {
+    // Extracts the chunk as well as setting any relevant info about the image.
+    pub fn nextChunk(self: *Decoder) !?Chunk {
+        if (!self.lastChunk) {
+            const chunk = try Chunk.parse(&self.data);
+            std.debug.print("Chunk Type: {}\n", .{chunk.chunkType()});
+            const chunkData = try chunk.parseData();
+            switch (chunkData) {
                 .IHDR => {
-                    header = try Header.unmarshal(chunk.data.allocatedSlice());
-                    std.debug.print("header: {any}\n", .{header});
+                    self.header = chunkData.IHDR;
                 },
+
                 .IEND => {
-                    break;
+                    self.lastChunk = true;
                 },
-                .IDAT => {
-                    try data.appendSlice(chunk.data.allocatedSlice());
-                },
-                .PLTE => {
-                    palette = Palette.unmarshal(chunk.data.allocatedSlice());
-                },
-                .Ancillary => {},
+                else => {},
             }
+            return chunk;
+        } else {
+            return null;
         }
-        std.debug.print("Total IDT Data len: {}\n", .{data.items.len});
-
-        var dataBuffer = std.io.fixedBufferStream(data.allocatedSlice());
-
-        const uncompressed = decompress(dataBuffer.reader(), allocator).?;
-
-        std.log.info("Uncompressed Length: {}", .{uncompressed.items.len});
-
-        return Self{ .chunks = chunks, .data = uncompressed, .header = header, .palette = palette };
     }
 
-    fn decompress(reader: anytype, allocator: Allocator) ?std.ArrayList(u8) {
+    // Caller owns the data, the function returns
+    pub fn collectAllData(self: *Decoder, allocator: Allocator) ![]u8 {
+        //TODO: Implement a reader on top of decoder
+        var dataBuffer = std.ArrayList(u8).init(allocator);
+
+        while (try self.nextChunk()) |chunk| {
+            std.debug.print("Chunk Type: {}\n", .{chunk.chunkType()});
+            if (chunk.chunkType() == ChunkType.IDAT) {
+                try dataBuffer.appendSlice(chunk.data);
+            }
+        }
+        return dataBuffer.toOwnedSlice();
+    }
+
+    // Caller owns the data, the function returns
+    pub fn decompress(reader: anytype, allocator: Allocator) ![]u8 {
         var buf = std.ArrayList(u8).init(allocator);
+        defer buf.deinit();
 
         var d = inflate.decompressor(.zlib, reader);
         d.decompress(buf.writer()) catch |err| {
-            std.log.err("Failed to decompress: {}", .{err});
-            buf.deinit();
-            return null;
+            return err;
         };
-        return buf;
+        return buf.toOwnedSlice();
     }
 
-    // pub fn display(header: Header, palette: Palette, data: []u8) !void {
-    //     const output_ppf_f = try std.fs.cwd().createFile("output.ppm", .{});
-    //     defer output_ppf_f.close();
-    //     const writer = output_ppf_f.writer();
-    //     try writer.print(
-    //         \\P6
-    //         \\{d} {d}
-    //         \\255
-    //         \\
-    //     , .{ header.width, header.height });
-
-    //     for (data) |px| {
-    //         // debug.print("{} ", .{px});
-    //         try writer.writeByte(palette.data[px % 6]);
-    //     }
-    // }
-
-    pub fn display(header: Header, data: []u8) !void {
-        const output_ppf_f = try std.fs.cwd().createFile("output.ppm", .{});
-        defer output_ppf_f.close();
-        const writer = output_ppf_f.writer();
-        try writer.print(
-            \\P6
-            \\{d} {d}
-            \\255
-            \\
-        , .{ header.width, header.height });
+    // Returns display image data. It may modify the provided buffer data
+    // It only supports images of color type 2 and bit depth 8.
+    // It returns a slice that the caller owns
+    pub fn displayData(self: Decoder, allocator: Allocator, data: []u8) ![]u8 {
+        var dd = std.ArrayList(u8).init(allocator);
         const bytesPerPixel = 3;
+        const header = self.header orelse return error.NoHeaderFound;
+
+        if (header.bitDepth != 8 or header.colorType != 2) {
+            return error.UnsupportedFileFormat;
+        }
+
         const bytesPerScanLine = (header.width * bytesPerPixel) + 1;
 
         for (0..header.height) |y| {
@@ -103,6 +86,8 @@ pub const Decoder = struct {
 
             const start = y * bytesPerScanLine + 1;
             const end = start + bytesPerScanLine - 1;
+
+            var scanLine = data[start..end];
 
             var previousScanLine: ?[]const u8 = null;
 
@@ -116,14 +101,14 @@ pub const Decoder = struct {
                 .None => {},
                 .Sub => {
                     for (0..bytesPerScanLine - 1) |i| {
-                        const sub: u8 = if (i < bytesPerPixel) 0 else data[start + (i - bytesPerPixel)];
-                        data[start + i] = @truncate(try std.math.add(usize, data[start + i], sub) % 256);
+                        const sub: u8 = if (i < bytesPerPixel) 0 else scanLine[(i - bytesPerPixel)];
+                        scanLine[i] = @truncate(try std.math.add(usize, scanLine[i], sub) % 256);
                     }
                 },
 
                 .Up => {
                     for (0..bytesPerScanLine - 1) |i| {
-                        data[start + i] = @truncate(try std.math.add(usize, data[start + i], previousScanLine.?[i]) % 256);
+                        scanLine[i] = @truncate(try std.math.add(usize, scanLine[i], previousScanLine.?[i]) % 256);
                     }
                 },
                 .Average => {
@@ -131,16 +116,16 @@ pub const Decoder = struct {
                         const prior_val = previousScanLine.?[i];
 
                         const sub: usize = std.math.sub(usize, i, bytesPerPixel) catch 0;
-                        const sub_val = data[sub];
+                        const sub_val = scanLine[sub];
 
                         const average: usize = @divFloor((sub_val + prior_val), 2);
 
-                        data[start + i] = @truncate(try std.math.add(usize, data[start + i], average) % 256);
+                        scanLine[i] = @truncate(try std.math.add(usize, scanLine[i], average) % 256);
                     }
                 },
                 .Paeth => {
                     for (0..bytesPerScanLine - 1) |i| {
-                        const sub_val: isize = if (i < bytesPerPixel) 0 else data[start + (i - bytesPerPixel)];
+                        const sub_val: isize = if (i < bytesPerPixel) 0 else scanLine[(i - bytesPerPixel)];
 
                         const prior_val: isize = previousScanLine.?[i];
 
@@ -148,186 +133,151 @@ pub const Decoder = struct {
 
                         const val = paethPredictor(isize, sub_val, prior_val, prior_bpp_val);
 
-                        const valf: usize = @intCast(try std.math.add(isize, data[start + i], val));
+                        const valf: usize = @intCast(try std.math.add(isize, scanLine[i], val));
 
                         const final_val: u8 = @truncate(valf % 256);
-                        data[start + i] = final_val;
+                        scanLine[i] = final_val;
                     }
                 },
             }
-
-            try writer.writeAll(data[start..end]);
-
-            // for (data[start .. end + 1]) |px| {
-            // try writer.writeByte(@truncate(px >> 16));
-            // try writer.writeByte(@truncate(px >> 8));
-            // }
+            try dd.appendSlice(scanLine);
         }
+        return dd.toOwnedSlice();
     }
 
     const Filter = enum { None, Sub, Up, Average, Paeth };
 
-    pub fn deinit(self: Self) void {
-        for (self.chunks.items) |item| {
-            item.deinit();
-        }
-        self.chunks.deinit();
-        self.data.deinit();
-    }
+    const ChunkData = union(ChunkType) { IHDR: IHDR, IEND: IEND, IDAT: IDAT, Ancillary: Ancillary };
 
-    fn paethPredictor(comptime T: type, a: T, b: T, c: T) T {
-        const p = a + b - c;
-        const pa: usize = @abs(p - a);
-        const pb: usize = @abs(p - b);
-        const pc: usize = @abs(p - c);
-        var lowest = a;
-        if (pa <= pb and pa <= pc) {
-            lowest = a;
-        } else if (pb <= pc) {
-            lowest = b;
-        } else {
-            lowest = c;
-        }
-        return lowest;
-    }
-};
+    const ChunkType = enum { IHDR, IEND, IDAT, Ancillary };
 
-// crc is calculated over chunk type and data and not length
-pub const Chunk = struct {
-    const Self = @This();
-    length: u32,
-    chunkType: ChunkType,
-    data: std.ArrayList(u8),
-    crc: u32,
+    const Chunk = struct {
+        length: u32,
+        tipe: []const u8,
+        data: []const u8,
+        crc: u32,
 
-    pub fn init(reader: anytype, allocator: Allocator) !Self {
-        var buf: [4]u8 = undefined;
-        var bytes_read = try reader.read(&buf);
-        if (bytes_read != 4) {
-            return ReadError.NotEnoughData;
+        fn chunkType(self: Chunk) ChunkType {
+            return std.meta.stringToEnum(ChunkType, self.tipe) orelse ChunkType.Ancillary;
         }
 
-        const length = try readBe(u32, &buf);
-
-        var crcHasher = std.hash.crc.Crc32.init();
-
-        var chunkTypeBuf: [4]u8 = undefined;
-
-        bytes_read = try reader.read(&chunkTypeBuf);
-        if (bytes_read != 4) {
-            return ReadError.NotEnoughData;
+        fn parseData(self: Chunk) !ChunkData {
+            switch (self.chunkType()) {
+                .IHDR => {
+                    return ChunkData{ .IHDR = try IHDR.parse(self.data) };
+                },
+                .IEND => return ChunkData{ .IEND = IEND.parse() },
+                .IDAT => return ChunkData{ .IDAT = IDAT.parse(self.data) },
+                .Ancillary => return ChunkData{ .Ancillary = Ancillary.parse(self.tipe, self.data) },
+            }
         }
 
-        crcHasher.update(&chunkTypeBuf);
+        fn parse(reader: *Buffer) !Chunk {
+            const length = try readBe(u32, try reader.readNBytes(4));
 
-        var dataArrayList = try std.ArrayList(u8).initCapacity(allocator, length);
+            var crcHasher = std.hash.crc.Crc32.init();
 
-        bytes_read = try reader.read(dataArrayList.allocatedSlice());
-        if (bytes_read != length) {
-            return ReadError.NotEnoughData;
+            const chunkTypeBuf = try reader.readNBytes(4);
+
+            crcHasher.update(chunkTypeBuf);
+
+            const data = try reader.readNBytes(length);
+
+            crcHasher.update(data);
+
+            const crc = try readBe(u32, try reader.readNBytes(4));
+
+            const calculatedCrc32: u32 = crcHasher.final();
+
+            if (calculatedCrc32 != crc) {
+                @panic("invalid crc");
+            }
+
+            return Chunk{ .length = length, .tipe = chunkTypeBuf, .data = data, .crc = crc };
         }
-
-        crcHasher.update(dataArrayList.allocatedSlice());
-
-        bytes_read = try reader.read(&buf);
-        if (bytes_read != 4) {
-            return ReadError.NotEnoughData;
-        }
-
-        const crc = try readBe(u32, &buf);
-
-        const calculatedCrc32: u32 = crcHasher.final();
-
-        if (calculatedCrc32 != crc) {
-            @panic("invalid crc");
-        }
-
-        const chunkType = std.meta.stringToEnum(ChunkType, &chunkTypeBuf) orelse ChunkType.Ancillary;
-
-        return Self{ .length = length, .chunkType = chunkType, .data = dataArrayList, .crc = crc };
-    }
-
-    /// Release all allocated memory.
-    pub fn deinit(self: Self) void {
-        self.data.deinit();
-    }
-};
-
-pub const Data = struct {
-    const Self = @This();
-    pub fn unmarshal(data: []u8) void {
-        const identifier = data[0];
-        std.debug.print("{any}\n", .{identifier});
-    }
-};
-
-pub const Palette = struct {
-    const Self = @This();
-    data: []const u8,
-
-    pub fn unmarshal(data: []const u8) Self {
-        std.debug.print("Palette, Len: {} {any}\n", .{ data.len, data });
-        return Self{ .data = data };
-    }
-};
-
-pub const Header = struct {
-    const Self = @This();
-
-    width: u32,
-    height: u32,
-    bitDepth: u8,
-    colorType: u8,
-    compressionMethod: u8, //  only accepted value is 0
-    filterMethod: u8, // only accepted value is 0,
-    interlaceMethod: InterlaceMethod,
-
-    pub fn unmarshal(data: []u8) !Self {
-        assert(data.len == 13);
-        var offset: usize = 0;
-
-        const width = try readBe(u32, data[offset .. offset + 4]);
-        offset += 4;
-
-        const height = try readBe(u32, data[offset .. offset + 4]);
-        offset += 4;
-
-        const bitDepth = try readBe(u8, data[offset .. offset + 1]);
-        offset += 1;
-
-        const colorType = data[offset];
-        offset += 1;
-
-        const compressionMethod = data[offset];
-        offset += 1;
-        assert(compressionMethod == 0);
-
-        const filterMethod = data[offset];
-        offset += 1;
-        assert(filterMethod == 0);
-
-        const interlaceMethod: InterlaceMethod = @enumFromInt(@intFromPtr(&data[offset .. offset + 1]));
-        offset += 1;
-        return Self{ .width = width, .height = height, .bitDepth = bitDepth, .colorType = colorType, .compressionMethod = compressionMethod, .filterMethod = filterMethod, .interlaceMethod = interlaceMethod };
-    }
+    };
 
     const InterlaceMethod = enum { Adam7, NoInterlace };
+
+    pub const IHDR = struct {
+        width: u32,
+        height: u32,
+        bitDepth: u8,
+        colorType: u8,
+        compressionMethod: u8, //  only accepted value is 0
+        filterMethod: u8, // only accepted value is 0,
+        interlaceMethod: InterlaceMethod,
+
+        fn parse(data: []const u8) !IHDR {
+            assert(data.len == 13);
+            var offset: usize = 0;
+
+            const width = try readBe(u32, data[offset .. offset + 4]);
+            offset += 4;
+
+            const height = try readBe(u32, data[offset .. offset + 4]);
+            offset += 4;
+
+            const bitDepth = try readBe(u8, data[offset .. offset + 1]);
+            offset += 1;
+
+            const colorType = data[offset];
+            offset += 1;
+
+            const compressionMethod = data[offset];
+            offset += 1;
+            assert(compressionMethod == 0);
+
+            const filterMethod = data[offset];
+            offset += 1;
+            assert(filterMethod == 0);
+
+            const interlaceMethod: InterlaceMethod = @enumFromInt(@intFromPtr(&data[offset .. offset + 1]));
+            offset += 1;
+            return IHDR{ .width = width, .height = height, .bitDepth = bitDepth, .colorType = colorType, .compressionMethod = compressionMethod, .filterMethod = filterMethod, .interlaceMethod = interlaceMethod };
+        }
+    };
+
+    pub const IEND = struct {
+        // This does not have any data
+        fn parse() IEND {
+            return IEND{};
+        }
+    };
+
+    pub const IDAT = struct {
+        data: []const u8,
+        fn parse(data: []const u8) IDAT {
+            return IDAT{ .data = data };
+        }
+    };
+
+    pub const Ancillary = struct {
+        tipe: []const u8,
+        data: []const u8,
+        fn parse(tipe: []const u8, data: []const u8) Ancillary {
+            return Ancillary{ .tipe = tipe, .data = data };
+        }
+    };
 };
 
-const ReadError = error{NotEnoughData};
-
-fn readBe(comptime T: type, buf: []u8) ReadError!T {
+fn readBe(comptime T: type, buf: []const u8) !T {
     if (@sizeOf(T) > buf.len) {
-        return ReadError.NotEnoughData;
+        return error.NotEnoughData;
     }
     const a: T = std.mem.readInt(T, buf[0..@sizeOf(T)], std.builtin.Endian.big);
     return a;
 }
 
-pub const ChunkType = enum {
-    IHDR,
-    IDAT,
-    IEND,
-    PLTE,
-    Ancillary,
-};
+fn paethPredictor(comptime T: type, a: T, b: T, c: T) T {
+    const p = a + b - c;
+    const pa: usize = @abs(p - a);
+    const pb: usize = @abs(p - b);
+    const pc: usize = @abs(p - c);
+    if (pa <= pb and pa <= pc) {
+        return a;
+    } else if (pb <= pc) {
+        return b;
+    }
+    return c;
+}
